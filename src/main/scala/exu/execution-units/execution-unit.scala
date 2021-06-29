@@ -30,6 +30,9 @@ import boom.common._
 import boom.ifu.{GetPCFromFtqIO}
 import boom.util.{ImmGen, IsKilledByBranch, BranchKillableQueue, BoomCoreStringPrefix}
 
+
+
+
 /**
  * Response from Execution Unit. Bundles a MicroOp with data
  *
@@ -134,6 +137,9 @@ abstract class ExecutionUnit(
 
     // TODO move this out of ExecutionUnit
     val com_exception = if (hasMem || hasRocc) Input(Bool()) else null
+
+		// upec patch #1
+		val rob_head = Input(UInt(robAddrSz.W))
   })
 
   if (writesIrf)   {
@@ -241,6 +247,10 @@ class ALUExeUnit(
 
   val div_busy  = WireInit(false.B)
   val ifpu_busy = WireInit(false.B)
+
+	// upec patch #1
+	val div_won_port_contention = WireInit(false.B)
+	//-------------
 
   // The Functional Units --------------------
   // Specifically the functional units with fast writeback to IRF
@@ -361,8 +371,13 @@ class ALUExeUnit(
     div.io.brupdate            := io.brupdate
     div.io.req.bits.kill       := io.req.bits.kill
 
+// upec patch #1
+// original :
     // share write port with the pipelined units
-    div.io.resp.ready := !(iresp_fu_units.map(_.io.resp.valid).reduce(_|_))
+//    div.io.resp.ready := !(iresp_fu_units.map(_.io.resp.valid).reduce(_|_))
+
+		div.io.resp.ready := !(iresp_fu_units.map(_.io.resp.valid).reduce(_|_)) || div_won_port_contention
+
 
     div_resp_val := div.io.resp.valid
     div_busy     := !div.io.req.ready ||
@@ -394,26 +409,204 @@ class ALUExeUnit(
   // Outputs (Write Port #0)  ---------------
   if (writesIrf) {
     io.iresp.valid     := iresp_fu_units.map(_.io.resp.valid).reduce(_|_)
-    io.iresp.bits.uop  := PriorityMux(iresp_fu_units.map(f =>
-      (f.io.resp.valid, f.io.resp.bits.uop)))
-    io.iresp.bits.data := PriorityMux(iresp_fu_units.map(f =>
-      (f.io.resp.valid, f.io.resp.bits.data)))
-    io.iresp.bits.predicated := PriorityMux(iresp_fu_units.map(f =>
-      (f.io.resp.valid, f.io.resp.bits.predicated)))
 
-    // pulled out for critical path reasons
-    // TODO: Does this make sense as part of the iresp bundle?
-    if (hasAlu) {
-      io.iresp.bits.uop.csr_addr := ImmGen(alu.io.resp.bits.uop.imm_packed, IS_I).asUInt
-      io.iresp.bits.uop.ctrl.csr_cmd := alu.io.resp.bits.uop.ctrl.csr_cmd
-    }
-  }
+// upec patch #1 : fixed priority mux is replaced by program order priority
 
+// Original Code
+// -------------
+//    io.iresp.bits.uop  := PriorityMux(iresp_fu_units.map(f =>
+//      (f.io.resp.valid, f.io.resp.bits.uop)))
+//    io.iresp.bits.data := PriorityMux(iresp_fu_units.map(f =>
+//      (f.io.resp.valid, f.io.resp.bits.data)))
+//    io.iresp.bits.predicated := PriorityMux(iresp_fu_units.map(f =>
+//      (f.io.resp.valid, f.io.resp.bits.predicated)))
+//  	if (hasAlu) {
+//      	io.iresp.bits.uop.csr_addr := ImmGen(alu.io.resp.bits.uop.imm_packed, IS_I).asUInt
+//      	io.iresp.bits.uop.ctrl.csr_cmd := alu.io.resp.bits.uop.ctrl.csr_cmd
+//    }
+// -------------
+
+
+//--------------
+// upec patch #1 
+//	def isOlder(id1 : UInt, id2 : UInt, head : UInt): Boolean = {
+//		// if id1 is older than id2 return true, otherwise false
+//		when (id2 > head) {
+//			when (id1 < id2 && id1 >= head){
+//				return true
+//			}.otherwise {
+//				return false
+//			}
+//		}.elsewhen (id2 < head) {
+//			when (id1 < id2 || id1 >= head){
+//				return true
+//			}.otherwise {
+//				return false
+//			}
+//		}.otherwise {
+//			return false
+//		}
+//	}
+// -------------
+
+
+// Notes: possible simplification: maximum size is 3 (only ALU, IMUL and DIV
+// use int register port).
+// Contention is only possible between non-pipelined and pipelined, so ALU and
+// IMUL will never compete! 
+// only the logic for DIV resp.ready should be modified : check if the
+// selected fu hasDiv is set
+// only possible contentions in the original design : IMUL and DIV and ALU and DIV
+// even if there are 3 FUs, it is by design impossible to have 3 FUs competing
+// at the same time 
+// in the patched design, this can be different, the delay alu resp can now
+// compete with the current mul resp
+		if (iresp_fu_units.size == 1) {
+			io.iresp.bits.uop := iresp_fu_units(0).io.resp.bits.uop
+			io.iresp.bits.data := iresp_fu_units(0).io.resp.bits.data
+			io.iresp.bits.predicated := iresp_fu_units(0).io.resp.bits.predicated
+	  	if (hasAlu) {
+      	io.iresp.bits.uop.csr_addr := ImmGen(alu.io.resp.bits.uop.imm_packed, IS_I).asUInt
+      	io.iresp.bits.uop.ctrl.csr_cmd := alu.io.resp.bits.uop.ctrl.csr_cmd
+  		}
+		}
+
+		if (iresp_fu_units.size == 2) {
+			val fu0_rob_idx = iresp_fu_units(0).io.resp.bits.uop.rob_idx
+			val fu1_rob_idx = iresp_fu_units(1).io.resp.bits.uop.rob_idx
+			
+			when ( iresp_fu_units(1).io.resp.valid && // fu1 is older
+						 ( ( fu0_rob_idx > io.rob_head && fu1_rob_idx >= io.rob_head && fu1_rob_idx < fu0_rob_idx ) || 
+							   ( fu0_rob_idx < io.rob_head && ( fu1_rob_idx >= io.rob_head || fu1_rob_idx < fu0_rob_idx ) ) ) ) {
+				io.iresp.bits.uop := iresp_fu_units(1).io.resp.bits.uop
+				io.iresp.bits.data := iresp_fu_units(1).io.resp.bits.data
+				io.iresp.bits.predicated := iresp_fu_units(1).io.resp.bits.predicated
+	  		if (hasAlu) {
+      		io.iresp.bits.uop.csr_addr := 0.U
+      		io.iresp.bits.uop.ctrl.csr_cmd := 0.U
+  			}
+				if ( hasDiv ) {
+					div_won_port_contention := true.B
+				}
+			} .otherwise {
+		    io.iresp.bits.uop  := PriorityMux(iresp_fu_units.map(f =>(f.io.resp.valid, f.io.resp.bits.uop)))
+		    io.iresp.bits.data := PriorityMux(iresp_fu_units.map(f =>(f.io.resp.valid, f.io.resp.bits.data)))
+		    io.iresp.bits.predicated := PriorityMux(iresp_fu_units.map(f =>(f.io.resp.valid, f.io.resp.bits.predicated)))
+		  	if (hasAlu) {
+  		  	io.iresp.bits.uop.csr_addr := ImmGen(alu.io.resp.bits.uop.imm_packed, IS_I).asUInt
+    			io.iresp.bits.uop.ctrl.csr_cmd := alu.io.resp.bits.uop.ctrl.csr_cmd
+  			}
+			}
+		}
+
+		if (iresp_fu_units.size == 3) {
+			val fu0_rob_idx = iresp_fu_units(0).io.resp.bits.uop.rob_idx
+			val fu1_rob_idx = iresp_fu_units(1).io.resp.bits.uop.rob_idx
+			val fu2_rob_idx = iresp_fu_units(2).io.resp.bits.uop.rob_idx
+
+			when ( iresp_fu_units(2).io.resp.valid &&
+						( ( fu1_rob_idx > io.rob_head && fu2_rob_idx >= io.rob_head && fu2_rob_idx < fu1_rob_idx ) || // older than fu1 or fu1 not valied
+							   ( fu1_rob_idx < io.rob_head && ( fu2_rob_idx >= io.rob_head || fu2_rob_idx < fu1_rob_idx ) ) || !iresp_fu_units(1).io.resp.valid ) && 
+						  ( ( fu0_rob_idx > io.rob_head && fu2_rob_idx >= io.rob_head && fu2_rob_idx < fu0_rob_idx ) || // older than fu0 or fu0 not valied
+							    ( fu0_rob_idx < io.rob_head && ( fu2_rob_idx >= io.rob_head || fu2_rob_idx < fu0_rob_idx ) ) || !iresp_fu_units(0).io.resp.valid ) ) {
+
+				io.iresp.bits.uop := iresp_fu_units(2).io.resp.bits.uop
+				io.iresp.bits.data := iresp_fu_units(2).io.resp.bits.data
+				io.iresp.bits.predicated := iresp_fu_units(2).io.resp.bits.predicated
+	  		if (hasAlu) {
+      		io.iresp.bits.uop.csr_addr := 0.U
+      		io.iresp.bits.uop.ctrl.csr_cmd := 0.U
+  			}
+				if ( hasDiv ) { // Div is always the last one in the array
+					div_won_port_contention := true.B
+				}
+			} .elsewhen ( iresp_fu_units(1).io.resp.valid && 
+										( ( fu0_rob_idx > io.rob_head && fu1_rob_idx >= io.rob_head && fu1_rob_idx < fu0_rob_idx ) || // older than fu1 or fu1 not valied
+							  			 ( fu0_rob_idx < io.rob_head && ( fu1_rob_idx >= io.rob_head || fu1_rob_idx < fu0_rob_idx ) ) || !iresp_fu_units(0).io.resp.valid ) ) {
+
+				io.iresp.bits.uop := iresp_fu_units(1).io.resp.bits.uop
+				io.iresp.bits.data := iresp_fu_units(1).io.resp.bits.data
+				io.iresp.bits.predicated := iresp_fu_units(1).io.resp.bits.predicated
+	  		if (hasAlu) {
+      		io.iresp.bits.uop.csr_addr := 0.U
+      		io.iresp.bits.uop.ctrl.csr_cmd := 0.U
+  			}
+			} .otherwise {
+
+		    io.iresp.bits.uop  := PriorityMux(iresp_fu_units.map(f =>(f.io.resp.valid, f.io.resp.bits.uop)))
+		    io.iresp.bits.data := PriorityMux(iresp_fu_units.map(f =>(f.io.resp.valid, f.io.resp.bits.data)))
+		    io.iresp.bits.predicated := PriorityMux(iresp_fu_units.map(f =>(f.io.resp.valid, f.io.resp.bits.predicated)))
+		  	if (hasAlu) {
+  		  	io.iresp.bits.uop.csr_addr := ImmGen(alu.io.resp.bits.uop.imm_packed, IS_I).asUInt
+    			io.iresp.bits.uop.ctrl.csr_cmd := alu.io.resp.bits.uop.ctrl.csr_cmd
+  			}
+			}
+		}
+
+//		if (iresp_fu_units.size == 4) { // possibly redundant 
+//			val fu0_rob_idx = iresp_fu_units(0).io.resp.bits.uop.rob_idx
+//			val fu1_rob_idx = iresp_fu_units(1).io.resp.bits.uop.rob_idx
+//			val fu2_rob_idx = iresp_fu_units(2).io.resp.bits.uop.rob_idx
+//			val fu3_rob_idx = iresp_fu_units(3).io.resp.bits.uop.rob_idx
+//
+//			when ( iresp_fu_units(3).io.resp.valid &&
+//						( ( fu2_rob_idx > io.rob_head && fu3_rob_idx >= io.rob_head && fu3_rob_idx < fu2_rob_idx ) || // older than fu1 or fu1 not valied
+//			  		 ( fu2_rob_idx < io.rob_head && ( fu3_rob_idx >= io.rob_head || fu3_rob_idx < fu2_rob_idx ) ) || !iresp_fu_units(2).io.resp.valid ) && 
+//							( ( fu1_rob_idx > io.rob_head && fu3_rob_idx >= io.rob_head && fu3_rob_idx < fu1_rob_idx ) || // older than fu1 or fu1 not valied
+//				  		 ( fu1_rob_idx < io.rob_head && ( fu3_rob_idx >= io.rob_head || fu3_rob_idx < fu1_rob_idx ) ) || !iresp_fu_units(1).io.resp.valid ) && 
+//			  				( ( fu0_rob_idx > io.rob_head && fu3_rob_idx >= io.rob_head && fu3_rob_idx < fu0_rob_idx ) || // older than fu0 or fu0 not valied
+//				   			 ( fu0_rob_idx < io.rob_head && ( fu3_rob_idx >= io.rob_head || fu3_rob_idx < fu0_rob_idx ) ) || !iresp_fu_units(0).io.resp.valid ) ) {
+//			
+//				io.iresp.bits.uop := iresp_fu_units(3).io.resp.bits.uop
+//				io.iresp.bits.data := iresp_fu_units(3).io.resp.bits.data
+//				io.iresp.bits.predicated := iresp_fu_units(3).io.resp.bits.predicated
+//	  		if (hasAlu) {
+//      		io.iresp.bits.uop.csr_addr := 0.U
+//      		io.iresp.bits.uop.ctrl.csr_cmd := 0.U
+//  			}
+//			} .elsewhen ( iresp_fu_units(2).io.resp.valid &&
+//										( ( fu1_rob_idx > io.rob_head && fu2_rob_idx >= io.rob_head && fu2_rob_idx < fu1_rob_idx ) || // older than fu1 or fu1 not valied
+//							  		 ( fu1_rob_idx < io.rob_head && ( fu2_rob_idx >= io.rob_head || fu2_rob_idx < fu1_rob_idx ) ) || !iresp_fu_units(1).io.resp.valid ) && 
+//						  				( ( fu0_rob_idx > io.rob_head && fu2_rob_idx >= io.rob_head && fu2_rob_idx < fu0_rob_idx ) || // older than fu0 or fu0 not valied
+//							   			 ( fu0_rob_idx < io.rob_head && ( fu2_rob_idx >= io.rob_head || fu2_rob_idx < fu0_rob_idx ) ) || !iresp_fu_units(0).io.resp.valid ) ) {
+//
+//				io.iresp.bits.uop := iresp_fu_units(2).io.resp.bits.uop
+//				io.iresp.bits.data := iresp_fu_units(2).io.resp.bits.data
+//				io.iresp.bits.predicated := iresp_fu_units(2).io.resp.bits.predicated
+//	  		if (hasAlu) {
+//      		io.iresp.bits.uop.csr_addr := 0.U
+//      		io.iresp.bits.uop.ctrl.csr_cmd := 0.U
+//  			}
+//			} .elsewhen ( iresp_fu_units(1).io.resp.valid && 
+//										( ( fu0_rob_idx > io.rob_head && fu1_rob_idx >= io.rob_head && fu1_rob_idx < fu0_rob_idx ) || // older than fu1 or fu1 not valied
+//							  			 ( fu0_rob_idx < io.rob_head && ( fu1_rob_idx >= io.rob_head || fu1_rob_idx < fu0_rob_idx ) ) || !iresp_fu_units(0).io.resp.valid ) ) {
+//
+//				io.iresp.bits.uop := iresp_fu_units(1).io.resp.bits.uop
+//				io.iresp.bits.data := iresp_fu_units(1).io.resp.bits.data
+//				io.iresp.bits.predicated := iresp_fu_units(1).io.resp.bits.predicated
+//	  		if (hasAlu) {
+//      		io.iresp.bits.uop.csr_addr := 0.U
+//      		io.iresp.bits.uop.ctrl.csr_cmd := 0.U
+//  			}
+//			} .otherwise {
+//
+//		    io.iresp.bits.uop  := PriorityMux(iresp_fu_units.map(f =>(f.io.resp.valid, f.io.resp.bits.uop)))
+//		    io.iresp.bits.data := PriorityMux(iresp_fu_units.map(f =>(f.io.resp.valid, f.io.resp.bits.data)))
+//		    io.iresp.bits.predicated := PriorityMux(iresp_fu_units.map(f =>(f.io.resp.valid, f.io.resp.bits.predicated)))
+//		  	if (hasAlu) {
+//  		  	io.iresp.bits.uop.csr_addr := ImmGen(alu.io.resp.bits.uop.imm_packed, IS_I).asUInt
+//    			io.iresp.bits.uop.ctrl.csr_cmd := alu.io.resp.bits.uop.ctrl.csr_cmd
+//  			}
+//			}
+//
+//		}
+// end of upec patch #1
+// --------------------
   assert ((PopCount(iresp_fu_units.map(_.io.resp.valid)) <= 1.U && !div_resp_val) ||
           (PopCount(iresp_fu_units.map(_.io.resp.valid)) <= 2.U && (div_resp_val)),
           "Multiple functional units are fighting over the write port.")
+	}
 }
-
 /**
  * FPU-only unit, with optional second write-port for ToInt micro-ops.
  *

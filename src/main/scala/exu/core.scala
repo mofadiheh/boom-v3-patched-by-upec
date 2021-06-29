@@ -226,10 +226,14 @@ class BoomCore(implicit p: Parameters) extends BoomModule
 
   for (eu <- exe_units) {
     eu.io.brupdate := brupdate
+    // upec patch #1
+		eu.io.rob_head := rob.io.rob_head_idx
   }
 
   if (usingFPU) {
     fp_pipeline.io.brupdate := brupdate
+		// upec patch #1
+		fp_pipeline.io.rob_head := rob.io.rob_head_idx
   }
 
   // Load/Store Unit & ExeUnits

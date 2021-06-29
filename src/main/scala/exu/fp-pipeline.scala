@@ -53,6 +53,9 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
 
     val debug_tsc_reg    = Input(UInt(width=xLen.W))
     val debug_wb_wdata   = Output(Vec(numWakeupPorts, UInt((fLen+1).W)))
+
+		// upec patch #1
+		val rob_head = Input(UInt(robAddrSz.W))
   })
 
   //**********************************
@@ -156,6 +159,9 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   //-------------------------------------------------------------
 
   exe_units.map(_.io.brupdate := io.brupdate)
+
+	// upec patch #1
+  exe_units.map(_.io.rob_head := io.rob_head)
 
   for ((ex,w) <- exe_units.withFilter(_.readsFrf).map(x=>x).zipWithIndex) {
     ex.io.req <> fregister_read.io.exe_reqs(w)
