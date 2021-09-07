@@ -249,6 +249,11 @@ class ALUExeUnit(
   val ifpu_busy = WireInit(false.B)
 
 	// upec patch #1
+	val alu_busy = WireInit(false.B)
+	val mul_busy = WireInit(false.B)
+	//-------------
+
+	// upec patch #1
 	val div_won_port_contention = WireInit(false.B)
 	//-------------
 
@@ -256,15 +261,27 @@ class ALUExeUnit(
   // Specifically the functional units with fast writeback to IRF
   val iresp_fu_units = ArrayBuffer[FunctionalUnit]()
 
-  io.fu_types := Mux(hasAlu.B, FU_ALU, 0.U) |
-                 Mux(hasMul.B, FU_MUL, 0.U) |
+// upec patch #1
+//  io.fu_types := Mux(hasAlu.B, FU_ALU, 0.U) |
+//                 Mux(hasMul.B, FU_MUL, 0.U) |
+//                 Mux(!div_busy && hasDiv.B, FU_DIV, 0.U) |
+//                 Mux(hasCSR.B, FU_CSR, 0.U) |
+//                 Mux(hasJmpUnit.B, FU_JMP, 0.U) |
+//                 Mux(!ifpu_busy && hasIfpu.B, FU_I2F, 0.U) |
+//                 Mux(hasMem.B, FU_MEM, 0.U)
+
+  io.fu_types := Mux(!alu_busy && hasAlu.B, FU_ALU, 0.U) |
+                 Mux(!mul_busy && hasMul.B, FU_MUL, 0.U) |
                  Mux(!div_busy && hasDiv.B, FU_DIV, 0.U) |
                  Mux(hasCSR.B, FU_CSR, 0.U) |
                  Mux(hasJmpUnit.B, FU_JMP, 0.U) |
                  Mux(!ifpu_busy && hasIfpu.B, FU_I2F, 0.U) |
                  Mux(hasMem.B, FU_MEM, 0.U)
+//----------------------------
+
 
   // ALU Unit -------------------------------
+
   var alu: ALUUnit = null
   if (hasAlu) {
     alu = Module(new ALUUnit(isJmpUnit = hasJmpUnit,
@@ -298,6 +315,7 @@ class ALUExeUnit(
     }
   }
 
+
   var rocc: RoCCShim = null
   if (hasRocc) {
     rocc = Module(new RoCCShim)
@@ -321,6 +339,7 @@ class ALUExeUnit(
 
   // Pipelined, IMul Unit ------------------
   var imul: PipelinedMulUnit = null
+
   if (hasMul) {
     imul = Module(new PipelinedMulUnit(imulLatency, xLen))
     imul.io <> DontCare
@@ -330,6 +349,8 @@ class ALUExeUnit(
     imul.io.req.bits.rs2_data := io.req.bits.rs2_data
     imul.io.req.bits.kill     := io.req.bits.kill
     imul.io.brupdate := io.brupdate
+
+
     iresp_fu_units += imul
   }
 
@@ -356,6 +377,7 @@ class ALUExeUnit(
     io.ll_fresp <> queue.io.deq
     ifpu_busy := !(queue.io.empty)
     assert (queue.io.enq.ready)
+
   }
 
   // Div/Rem Unit -----------------------
@@ -376,7 +398,7 @@ class ALUExeUnit(
     // share write port with the pipelined units
 //    div.io.resp.ready := !(iresp_fu_units.map(_.io.resp.valid).reduce(_|_))
 
-		div.io.resp.ready := !(iresp_fu_units.map(_.io.resp.valid).reduce(_|_)) || div_won_port_contention
+		div.io.resp.ready := div_won_port_contention
 
 
     div_resp_val := div.io.resp.valid
@@ -408,12 +430,116 @@ class ALUExeUnit(
 
   // Outputs (Write Port #0)  ---------------
   if (writesIrf) {
-    io.iresp.valid     := iresp_fu_units.map(_.io.resp.valid).reduce(_|_)
-
 // upec patch #1 : fixed priority mux is replaced by program order priority
+		if (!hasDiv) {
+		//same as the Original Boom
+	    io.iresp.valid     := iresp_fu_units.map(_.io.resp.valid).reduce(_|_)
+	    io.iresp.bits.uop  := PriorityMux(iresp_fu_units.map(f =>
+	      (f.io.resp.valid, f.io.resp.bits.uop)))
+	    io.iresp.bits.data := PriorityMux(iresp_fu_units.map(f =>
+	      (f.io.resp.valid, f.io.resp.bits.data)))
+	    io.iresp.bits.predicated := PriorityMux(iresp_fu_units.map(f =>
+	      (f.io.resp.valid, f.io.resp.bits.predicated)))
+	  	if (hasAlu) {
+	      	io.iresp.bits.uop.csr_addr := ImmGen(alu.io.resp.bits.uop.imm_packed, IS_I).asUInt
+	      	io.iresp.bits.uop.ctrl.csr_cmd := alu.io.resp.bits.uop.ctrl.csr_cmd
+	    }
+		}
+		else if (hasDiv && hasAlu && !hasMul) {
+			
+			// Queue the ALU resp
+			val alu_queue = Module(new BranchKillableQueue(new ExeUnitResp(xLen), entries = 5)) // TODO choose the size more wisely!!!
+			alu_queue.io.enq.valid       := alu.io.resp.valid
+	    alu_queue.io.enq.bits.uop    := alu.io.resp.bits.uop
+	    alu_queue.io.enq.bits.data   := alu.io.resp.bits.data
+	    alu_queue.io.enq.bits.predicated := alu.io.resp.bits.predicated
+	    alu_queue.io.brupdate := io.brupdate
+	    alu_queue.io.flush := io.req.bits.kill
+			alu_queue.io.enq.bits.fflags := DontCare
+
+			// we still need alu_busy
+			alu_busy := alu_queue.io.full
+
+
+			io.iresp.valid := alu_queue.io.deq.valid || div.io.resp.valid
+			
+			val fu0_rob_idx = alu_queue.io.deq.bits.uop.rob_idx
+			val fu1_rob_idx = div.io.resp.bits.uop.rob_idx
+
+
+			when ( div.io.resp.valid && ( ( !alu_queue.io.deq.valid ) || 
+							( ( fu0_rob_idx > io.rob_head && fu1_rob_idx >= io.rob_head && fu1_rob_idx < fu0_rob_idx ) || 
+							   ( fu0_rob_idx < io.rob_head && ( fu1_rob_idx >= io.rob_head || fu1_rob_idx < fu0_rob_idx ) ) ) ))
+			{
+				io.iresp.bits.uop := div.io.resp.bits.uop
+				io.iresp.bits.data := div.io.resp.bits.data
+				io.iresp.bits.predicated := div.io.resp.bits.predicated
+      	io.iresp.bits.uop.csr_addr := 0.U
+      	io.iresp.bits.uop.ctrl.csr_cmd := 0.U
+				div_won_port_contention := true.B
+				alu_queue.io.deq.ready := false.B
+			}.otherwise {
+				io.iresp.bits.uop := alu_queue.io.deq.bits.uop
+				io.iresp.bits.data := alu_queue.io.deq.bits.data
+				io.iresp.bits.predicated := alu_queue.io.deq.bits.predicated
+      	io.iresp.bits.uop.csr_addr := ImmGen(alu_queue.io.deq.bits.uop.imm_packed, IS_I).asUInt
+      	io.iresp.bits.uop.ctrl.csr_cmd := alu_queue.io.deq.bits.uop.ctrl.csr_cmd
+				div_won_port_contention := false.B
+				alu_queue.io.deq.ready := true.B
+			}
+		}
+		else if (hasDiv && !hasAlu && hasMul) {
+
+			// Queue the MUL resp
+			val imul_queue = Module(new BranchKillableQueue(new ExeUnitResp(xLen),entries = 5)) // TODO choose the size more wisely!!!
+	    imul_queue.io.enq.valid       := imul.io.resp.valid
+	    imul_queue.io.enq.bits.uop    := imul.io.resp.bits.uop
+	    imul_queue.io.enq.bits.data   := imul.io.resp.bits.data
+	    imul_queue.io.enq.bits.predicated := alu.io.resp.bits.predicated
+	    imul_queue.io.brupdate := io.brupdate
+	    imul_queue.io.flush := io.req.bits.kill
+			imul_queue.io.enq.bits.fflags := DontCare
+
+			// we still need mul_busy
+			mul_busy := imul_queue.io.full
+
+
+			io.iresp.valid := imul_queue.io.deq.valid || div.io.resp.valid
+			
+			val fu0_rob_idx = imul_queue.io.deq.bits.uop.rob_idx
+			val fu1_rob_idx = div.io.resp.bits.uop.rob_idx
+
+
+			when ( div.io.resp.valid && ( ( !imul_queue.io.deq.valid ) || 
+							( ( fu0_rob_idx > io.rob_head && fu1_rob_idx >= io.rob_head && fu1_rob_idx < fu0_rob_idx ) || 
+							   ( fu0_rob_idx < io.rob_head && ( fu1_rob_idx >= io.rob_head || fu1_rob_idx < fu0_rob_idx ) ) ) ))
+			{
+				io.iresp.bits.uop := div.io.resp.bits.uop
+				io.iresp.bits.data := div.io.resp.bits.data
+				io.iresp.bits.predicated := div.io.resp.bits.predicated
+      	io.iresp.bits.uop.csr_addr := 0.U
+      	io.iresp.bits.uop.ctrl.csr_cmd := 0.U
+				div_won_port_contention := true.B
+				imul_queue.io.deq.ready := false.B
+			}.otherwise {
+				io.iresp.bits.uop := imul_queue.io.deq.bits.uop
+				io.iresp.bits.data := imul_queue.io.deq.bits.data
+				io.iresp.bits.predicated := imul_queue.io.deq.bits.predicated
+      	io.iresp.bits.uop.csr_addr := 0.U
+      	io.iresp.bits.uop.ctrl.csr_cmd := 0.U
+				div_won_port_contention := false.B
+				imul_queue.io.deq.ready := true.B
+			}
+		}
+		// else if (hasDiv && hasAlu && hasMul) // TODO Future work!
+		// end of upec patch #1
+		// -------------------
+
+
 
 // Original Code
 // -------------
+//    io.iresp.valid     := iresp_fu_units.map(_.io.resp.valid).reduce(_|_)
 //    io.iresp.bits.uop  := PriorityMux(iresp_fu_units.map(f =>
 //      (f.io.resp.valid, f.io.resp.bits.uop)))
 //    io.iresp.bits.data := PriorityMux(iresp_fu_units.map(f =>
@@ -461,6 +587,14 @@ class ALUExeUnit(
 // at the same time 
 // in the patched design, this can be different, the delay alu resp can now
 // compete with the current mul resp
+
+
+
+
+
+
+
+/* // old fix not completely secure
 		if (iresp_fu_units.size == 1) {
 			io.iresp.bits.uop := iresp_fu_units(0).io.resp.bits.uop
 			io.iresp.bits.data := iresp_fu_units(0).io.resp.bits.data
@@ -542,7 +676,7 @@ class ALUExeUnit(
   			}
 			}
 		}
-
+*/
 //		if (iresp_fu_units.size == 4) { // possibly redundant 
 //			val fu0_rob_idx = iresp_fu_units(0).io.resp.bits.uop.rob_idx
 //			val fu1_rob_idx = iresp_fu_units(1).io.resp.bits.uop.rob_idx
